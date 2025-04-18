@@ -1,0 +1,120 @@
+# .github/workflows/street‑sweeping.yml
+name: Street‑Sweeping Reminder
+
+on:
+  # ——— Manual trigger for testing ———
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force‑send the reminder? (yes / no)"
+        required: false
+        default: "no"
+      side:
+        description: "Override side (far / close). Leave empty to auto‑detect."
+        required: false
+        default: ""
+  # ——— 11 AM Pacific every Mon‑Tue‑Thu‑Fri ———
+  schedule:
+    # 11 AM PDT (UTC‑7)  – Mar » early Nov
+    - cron: "0 18 * * 1,2,4,5"
+    # 11 AM PST (UTC‑8)  – early Nov » Mar
+    - cron: "0 19 * * 1,2,4,5"
+
+env:
+  TZ: America/Los_Angeles
+  TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+  TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+  FROM_PHONE_NUMBER: ${{ secrets.FROM_PHONE_NUMBER }}
+  PHONE_LIST: ${{ secrets.PHONE_LIST }} # +15551234567,+15557654321
+
+jobs:
+  sms:
+    runs-on: ubuntu-latest
+    steps:
+      # ─────────────────────────────────────────────────────────────
+      # Decide whether a reminder is needed (or forced) and craft it
+      # ─────────────────────────────────────────────────────────────
+      - name: Build reminder text
+        id: build
+        run: |
+          set -e
+          export TZ=America/Los_Angeles
+
+          # ---------- Inputs ----------
+          FORCE="${{ github.event.inputs.force || 'no' }}"
+          OVERRIDE_SIDE="${{ github.event.inputs.side || '' }}"
+
+          # ---------- Helpers ----------
+          dow=$(date +%u)                 # 1‑7 (Mon‑Sun)
+          dom=$(date +%d)                 # 01‑31
+          nth=$(( (10#$dom - 1) / 7 + 1)) # 1st / 2nd / 3rd …
+
+          needs=0
+          side=""      # 'far' or 'close'
+          when=""      # 'TOMORROW' or 'in one hour'
+          msg=""
+
+          if [ "$FORCE" = "yes" ]; then
+            # test mode – just send a generic message
+            needs=1
+            side="${OVERRIDE_SIDE:-far/close}"
+            when="(test)"
+          else
+            # ===== Normal schedule logic =====
+            if [ "$dow" = 1 ]; then                         # Monday → far side tomorrow
+              dom_tom=$(date -d 'tomorrow' +%d)
+              nth_tom=$(( (10#$dom_tom - 1) / 7 + 1))
+              if [ "$nth_tom" = 1 ] || [ "$nth_tom" = 3 ]; then
+                needs=1; side="far"; when="TOMORROW at noon"
+              fi
+
+            elif [ "$dow" = 2 ]; then                       # Tuesday → far side in 1 h
+              if [ "$nth" = 1 ] || [ "$nth" = 3 ]; then
+                needs=1; side="far"; when="in one hour (noon)"
+              fi
+
+            elif [ "$dow" = 4 ]; then                       # Thursday → close side tomorrow
+              dom_tom=$(date -d 'tomorrow' +%d)
+              nth_tom=$(( (10#$dom_tom - 1) / 7 + 1))
+              if [ "$nth_tom" = 1 ] || [ "$nth_tom" = 3 ]; then
+                needs=1; side="close"; when="TOMORROW at noon"
+              fi
+
+            elif [ "$dow" = 5 ]; then                       # Friday → close side in 1 h
+              if [ "$nth" = 1 ] || [ "$nth" = 3 ]; then
+                needs=1; side="close"; when="in one hour (noon)"
+              fi
+            fi
+
+            # Manual side override (only makes sense if message is going)
+            if [ -n "$OVERRIDE_SIDE" ] && [ "$needs" -eq 1 ]; then
+              side="$OVERRIDE_SIDE"
+            fi
+          fi
+
+          # ---------- Compose message ----------
+          if [ "$needs" -eq 1 ]; then
+            msg="🚗  Street‑sweeping (${side} side) **${when}** – move your car."
+            echo "MESSAGE=$msg" >> "$GITHUB_ENV"
+            echo "will_send=yes" >> "$GITHUB_ENV"
+          else
+            echo "Nothing to send."
+            exit 78   # neutral – marks job as skipped
+          fi
+      # ─────────────────────────────────────────────────────────────
+      # Send to every recipient in PHONE_LIST
+      # ─────────────────────────────────────────────────────────────
+      - name: Send SMS to all recipients
+        if: env.will_send == 'yes'
+        run: |
+          IFS=',' read -ra nums <<< "$PHONE_LIST"
+          for num in "${nums[@]}"; do
+            echo "→ Sending to $num"
+            curl -sS -X POST \
+              "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json" \
+              --data-urlencode "From=${FROM_PHONE_NUMBER}" \
+              --data-urlencode "To=$num" \
+              --data-urlencode "Body=${MESSAGE}" \
+              -u "${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}" \
+              | jq -r '.sid' 2>/dev/null || true
+          done
